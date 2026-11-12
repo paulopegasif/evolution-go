@@ -301,12 +301,59 @@ func (w whatsmeowService) ForceUpdateJid(instanceId string, number string) error
 	return nil
 }
 
+var (
+	authContainerMu sync.Mutex
+	authContainer   *sqlstore.Container
+)
+
+// getAuthContainer returns the process-wide whatsmeow store container, creating
+// it on first use. For Postgres the pool is bounded so many instances and
+// reconnects can never exhaust the server's connections.
+func (w whatsmeowService) getAuthContainer() (*sqlstore.Container, error) {
+	authContainerMu.Lock()
+	defer authContainerMu.Unlock()
+	if authContainer != nil {
+		return authContainer, nil
+	}
+
+	var dbLog waLog.Logger
+	if w.config.WaDebug != "" {
+		dbLog = waLog.Stdout("Database", w.config.WaDebug, true)
+	}
+
+	var container *sqlstore.Container
+	if w.config.PostgresAuthDB != "" {
+		db, err := sql.Open("postgres", w.config.PostgresAuthDB)
+		if err != nil {
+			return nil, err
+		}
+		db.SetMaxOpenConns(15)
+		db.SetMaxIdleConns(5)
+		db.SetConnMaxLifetime(5 * time.Minute)
+		db.SetConnMaxIdleTime(2 * time.Minute)
+		container = sqlstore.NewWithDB(db, "postgres", dbLog)
+		if err := container.Upgrade(context.Background()); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+	} else {
+		dsn := fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
+		var err error
+		container, err = sqlstore.New(context.Background(), "sqlite", dsn, dbLog)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	authContainer = container
+	return authContainer, nil
+}
+
 func (w whatsmeowService) StartClient(cd *ClientData) {
 
 	w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("Starting websocket connection to Whatsapp for user '%s'", cd.Instance.Id)
 
 	var deviceStore *store.Device
-	var err error
 
 	if w.clientPointer[cd.Instance.Id] != nil {
 		if w.clientPointer[cd.Instance.Id].IsConnected() {
@@ -314,24 +361,10 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 		}
 	}
 
-	var container *sqlstore.Container
-
-	if w.config.WaDebug != "" {
-		dbLog := waLog.Stdout("Database", w.config.WaDebug, true)
-		if w.config.PostgresAuthDB != "" {
-			container, err = sqlstore.New(context.Background(), "postgres", w.config.PostgresAuthDB, dbLog)
-		} else {
-			dsn := fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
-			container, err = sqlstore.New(context.Background(), "sqlite", dsn, dbLog)
-		}
-	} else {
-		if w.config.PostgresAuthDB != "" {
-			container, err = sqlstore.New(context.Background(), "postgres", w.config.PostgresAuthDB, nil)
-		} else {
-			dsn := fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
-			container, err = sqlstore.New(context.Background(), "sqlite", dsn, nil)
-		}
-	}
+	// Reuse one store container (and one bounded DB pool) for every client.
+	// Creating a new container per StartClient leaked an unbounded *sql.DB on
+	// each connect/reconnect/QR attempt until Postgres hit max_connections.
+	container, err := w.getAuthContainer()
 
 	if err != nil {
 		w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Failed to create container: %v", cd.Instance.Id, err)
